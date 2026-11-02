@@ -75,6 +75,23 @@ class AudioManager {
   // Codec power-down (CHIPPOWER off). begin() restores it.
   void powerDown();
 
+  // Release the I2S channel while leaving the codec powered and the amplifier
+  // enabled. The ESP32 has a fixed pool of I2S peripherals (two), and this class
+  // holds one for as long as it lives; a second audio stack that needs its own
+  // channel has to hand it back first. That is the case when ESP32-audioI2S
+  // drives playback (see lib/hal/HalAudioOutput.cpp): it owns the PCM pipeline
+  // and creates its own I2S channel, but still relies on this class for the
+  // ES8311 register table and the speaker amp.
+  void releaseI2s();
+
+  // Speaker-amp enable (GPIO 39 on this board). begin() deliberately leaves the
+  // amp off ("comes up only during playback") and the in-house playback path
+  // turns it on by itself — but a caller that uses the codec from this class and
+  // the PCM pipeline from somewhere else never passes through that path, so it
+  // must switch the amp itself. Silent output with a healthy decode and a rising
+  // playback position is exactly what a missing setAmp(true) looks like.
+  void setAmpEnable(bool on);
+
  private:
   struct WavInfo {
     uint32_t sampleRate = 0;
@@ -93,6 +110,7 @@ class AudioManager {
 
   bool codecInit();
   bool codecWrite(uint8_t reg, uint8_t value);
+  bool codecRead(uint8_t reg, uint8_t* value);
   void codecMute(bool mute);
   void setAmp(bool on);
   void rollbackBegin();
@@ -108,6 +126,7 @@ class AudioManager {
   void* txChan_ = nullptr;  // i2s_chan_handle_t (kept void* to slim the header)
   volatile bool chanEnabled_ = false;
   uint32_t currentRate_ = 0;
+  uint32_t diagPass_ = 0;  // throttle for the read/write timing diagnostic
 };
 
 }  // namespace freeink

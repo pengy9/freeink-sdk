@@ -8,6 +8,8 @@
 
 #include <Wire.h>
 #include <driver/i2s_std.h>
+#include <esp_heap_caps.h>
+#include <esp_task_wdt.h>
 
 #include <memory>
 
@@ -16,7 +18,7 @@ namespace freeink {
 namespace {
 
 constexpr uint32_t CODEC_I2C_HZ = 100000;  // OEM bus speed (shared with touch)
-constexpr size_t READ_CHUNK = 1024;        // mono source bytes per loop pass
+constexpr size_t READ_CHUNK = 4096;        // PCM bytes per loop pass (matched to the MP3 decoder's 4 KiB SD read / decode batch, so a single decode pass fuels many loop iterations instead of being discarded every pass)
 
 // ES8388 playback init recovered from the Murphy OEM firmware — exact register
 // order matters (staged mute -> clocks/format -> mixers -> power -> unmute).
@@ -50,10 +52,34 @@ constexpr RegVal ES8311_INIT[] = {
     {0x37, 0x08},  // DAC: bypass equalizer
 };
 
+// Waveshare 397 uses a dedicated external MCLK line (GPIO13) driven by the
+// ESP32-S3 I2S peripheral at 256×Fs. With MCLK always at 256×Fs, the ES8311's
+// clock-divider registers are CONSTANTS (per the Waveshare driver coefficient
+// table — every row where MCLK=256×Fs collapses to the same set), and the
+// sample rate is set by the I2S LRCK alone. The codec therefore needs no
+// re-tuning to switch sample rates: 8/11.025/12/16/22.05/24/32/44.1/48/64 kHz
+// all work with this one init sequence.
+//
+//   reg 0x01 = 0x3F  CLK_MANAGER: MCLK from MCLK pin (MCLK_SEL=0), clocks on
+//   reg 0x02 = 0x00  DIV_PRE=0, MULT_PRE=0 -> dig_mclk = MCLK (256×Fs)
+//   reg 0x03 = 0x10  ADC_OSR = 64×fs
+//   reg 0x04 = 0x10  DAC_OSR = 64×fs
+//   reg 0x05 = 0x00  ADC_DIV=0, DAC_DIV=0 -> adc/dac_mclk = dig_mclk
+//   reg 0x06 = 0x03  BCLK divider (master-mode only; we are slave)
+//   reg 0x07 = 0x00  LRCLK divider high
+//   reg 0x08 = 0xFF  LRCLK divider low
 constexpr RegVal ES8311_MCLK_16K_INIT[] = {
-    {0x00, 0x80}, {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x20},
+    {0x00, 0x80}, {0x01, 0x3F}, {0x02, 0x00}, {0x03, 0x10}, {0x04, 0x10},
     {0x05, 0x00}, {0x06, 0x03}, {0x07, 0x00}, {0x08, 0xFF}, {0x09, 0x0C},
-    {0x0D, 0x01}, {0x12, 0x00}, {0x13, 0x10}, {0x32, 0xCF}, {0x37, 0x08},
+    {0x0D, 0x01}, {0x12, 0x00}, {0x13, 0x10},
+    // DAC mute / volume. 0x31 is the DAC mute control: codecMute() writes 0x60 to
+    // silence it and 0x00 to open it, so an init table that omits 0x31 inherits
+    // whatever the chip powered up with — and "everything succeeds, position
+    // climbs, speaker silent" is precisely what a muted DAC looks like. The
+    // ES8388 table spells the equivalent explicitly (0x19 0x04 -> 0x19 0x00);
+    // this one was trimmed and lost the line.
+    {0x31, 0x00},
+    {0x32, 0xCF}, {0x37, 0x08},
 };
 
 constexpr uint8_t ES8311_VOL_MAX_REG = 0xCF;  // +16 dB, 0.5 dB/step (0xBF = 0 dB)
@@ -82,6 +108,16 @@ bool AudioManager::codecWrite(uint8_t reg, uint8_t value) {
   Wire.write(reg);
   Wire.write(value);
   return Wire.endTransmission() == 0;
+}
+
+bool AudioManager::codecRead(uint8_t reg, uint8_t* value) {
+  const auto& cfg = BoardConfig::ACTIVE.audio;
+  Wire.beginTransmission(cfg.codecAddr);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0) return false;
+  if (Wire.requestFrom(cfg.codecAddr, (uint8_t)1) != 1) return false;
+  *value = (uint8_t)Wire.read();
+  return true;
 }
 
 bool AudioManager::codecInit() {
@@ -113,7 +149,35 @@ bool AudioManager::codecInit() {
         break;
       }
     }
-    if (ok) return true;
+    if (ok) {
+      // Diagnose the actual codec clock registers after init: read back the
+      // divider/OSR values so a wrong write (vs a wrong rate) is distinguishable.
+      if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k) {
+        uint8_t r01 = 0, r02 = 0, r03 = 0, r04 = 0, r05 = 0, r08 = 0;
+        uint8_t r0d = 0, r12 = 0, r13 = 0, r31 = 0, r32 = 0;
+        codecRead(0x01, &r01);
+        codecRead(0x02, &r02);
+        codecRead(0x03, &r03);
+        codecRead(0x04, &r04);
+        codecRead(0x05, &r05);
+        codecRead(0x08, &r08);
+        codecRead(0x0D, &r0d);
+        codecRead(0x12, &r12);
+        codecRead(0x13, &r13);
+        codecRead(0x31, &r31);
+        codecRead(0x32, &r32);
+        // Read back the whole signal path, not just the clock registers. The
+        // output stage is where a "decoding fine but silent" fault shows up, and
+        // 0x31 in particular: it is the DAC mute bit, and an init table that
+        // omits it inherits whatever the chip powered up with.
+        Serial.printf("[AUDIO] ES8311 clk 01=%02x 02=%02x 03=%02x 04=%02x 05=%02x 08=%02x\n", r01,
+                      r02, r03, r04, r05, r08);
+        Serial.printf("[AUDIO] ES8311 out 0d=%02x 12=%02x 13=%02x 31=%02x 32=%02x\n", r0d, r12,
+                      r13, r31, r32);
+        if (r31 != 0x00) Serial.printf("[AUDIO] WARNING: DAC mute set (0x31=%02x)\n", r31);
+      }
+      return true;
+    }
     delay(100);
   }
   return false;
@@ -134,7 +198,12 @@ bool AudioManager::begin() {
     delay(10);  // codec rail ramp before the first I2C access
   }
 
-  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k && !ensureI2s(16000)) {
+  // Bring the I2S channel up once so the codec sees a valid clock before init,
+  // and so the first playback does not pay for channel creation. The rate here
+  // is only a starting point: ensureI2s() rebuilds the channel whenever the
+  // requested rate differs (see currentRate_), so 44.1 kHz covers the common
+  // MP3 case without a conversion.
+  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k && !ensureI2s(44100)) {
     log_e("audio mclk setup failed");
     rollbackBegin();
     return false;
@@ -154,9 +223,43 @@ void AudioManager::setVolume(uint8_t percent) {
   const auto& cfg = BoardConfig::ACTIVE.audio;
   if (cfg.codecAddr == 0) return;
   if (isEs8311(cfg.output)) {
-    // Single DAC volume register, 0.5 dB/step; full scale matches the init
-    // value M5 ships for this speaker (+16 dB).
-    codecWrite(0x32, (uint8_t)((uint16_t)percent * ES8311_VOL_MAX_REG / 100));
+    // ES8311 register 0x32 is a 0.5 dB-per-step attenuator, NOT a linear
+    // percentage: 0x00 = -95.5 dB (silence), 0xBF = 0 dB, 0xCF = +16 dB.
+    //
+    // Mapping percent straight onto the register (percent * 0xCF / 100) put the
+    // usable range in completely the wrong place. Its actual output was:
+    //   100% -> +8 dB     80% -> -13 dB     60% -> -33.5 dB
+    //    40% -> -54.5 dB  20% -> -75 dB
+    // i.e. the whole bottom half of the slider was already inaudible, and the
+    // top fifth threw away 21 dB. That is why "80" sounded like what you would
+    // expect from "60": almost all of the travel sat below 0 dB.
+    //
+    // Fix: interpolate in dB (which is what ears hear logarithmically) across a
+    // range that is actually useful, then convert back to 0.5 dB steps. The top
+    // stays at the codec init value so nothing gets louder than the speaker was
+    // tuned for; the floor is -55 dB, and 0 % is a hard mute.
+    //
+    // Resulting curve — a near-constant ~6.5 dB per 10 % step:
+    //   100% +8 dB | 80% -1.5 dB | 60% -15 dB | 40% -28.5 dB | 20% -42 dB | 0% mute
+    constexpr int kZeroDbReg = 0xBF;         // register value for 0 dB
+    constexpr int kVolFloorDbTimes10 = -550; // -55.0 dB at 1 %
+    constexpr int kVolTopDbTimes10 = 120;    // +12.0 dB at 100 %
+
+    if (percent == 0) {
+      // Hard mute rather than a very quiet signal: 0x00 is -95.5 dB, which the
+      // speaker/amp combination renders as silence.
+      codecWrite(0x32, 0x00);
+      return;
+    }
+
+    const int dbTimes10 =
+        kVolFloorDbTimes10 + (kVolTopDbTimes10 - kVolFloorDbTimes10) * percent / 100;
+    // One register step is 0.5 dB, and dbTimes10 is in tenths of a dB,
+    // so steps = db / 0.5 = dbTimes10 * 2 / 10 = dbTimes10 / 5.
+    int reg = kZeroDbReg + dbTimes10 / 5;
+    if (reg < 0x01) reg = 0x01;  // never land on the mute code by accident
+    if (reg > (int)ES8311_VOL_MAX_REG) reg = ES8311_VOL_MAX_REG;
+    codecWrite(0x32, (uint8_t)reg);
     return;
   }
   const uint8_t reg = (uint8_t)((uint16_t)percent * ES8388_VOL_MAX_REG / 100);
@@ -182,6 +285,25 @@ void AudioManager::setAmp(bool on) {
   const auto& cfg = BoardConfig::ACTIVE.audio;
   if (cfg.ampEnable == BoardConfig::PIN_UNASSIGNED) return;
   digitalWrite(cfg.ampEnable, on ? HIGH : LOW);
+}
+
+// Public form of the above. Unlike the private one it does not assume begin()
+// has already run, so a caller can hand the amp back at any point.
+void AudioManager::setAmpEnable(bool on) {
+  const auto& cfg = BoardConfig::ACTIVE.audio;
+  if (cfg.ampEnable == BoardConfig::PIN_UNASSIGNED) return;
+  pinMode(cfg.ampEnable, OUTPUT);
+  digitalWrite(cfg.ampEnable, on ? HIGH : LOW);
+  // Serial.printf, not log_i: this firmware builds at CORE_DEBUG_LEVEL 0, where
+  // log_i() compiles to nothing — its silence in the log is what made a missing
+  // amp enable look like a working one. Logging.h is not an option here either,
+  // this library does not link the custom serial implementation it needs.
+  // Only the transition is reported: playFile() calls this on every track.
+  static bool sLast = false;
+  if (on != sLast) {
+    sLast = on;
+    Serial.printf("[AUDIO] amp %s (gpio %d)\n", on ? "on" : "off", (int)cfg.ampEnable);
+  }
 }
 
 void AudioManager::rollbackBegin() {
@@ -248,9 +370,19 @@ bool AudioManager::parseWavHeader(const WavSource& source, WavInfo& info) {
 
 bool AudioManager::ensureI2s(uint32_t sampleRate) {
   const auto& cfg = BoardConfig::ACTIVE.audio;
-  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k && sampleRate != 16000) {
-    log_e("external-mclk ES8311 supports 16 kHz PCM only");
-    return false;
+  // ES8311 with external MCLK accepts any standard rate, because MCLK is always
+  // driven at 256 x Fs and the codec's divider registers are the same for every
+  // rate (see the table note above ES8311_MCLK_16K_INIT: 8/11.025/12/16/22.05/
+  // 24/32/44.1/48/64 kHz all use the identical init sequence). The old guard
+  // that rejected anything but 16 kHz was a leftover assumption, not a hardware
+  // limit — it is what forced every MP3 through a 44.1 -> 16 kHz resampler.
+  if (cfg.output == BoardConfig::AudioOutput::I2sEs8311Mclk16k) {
+    const bool supported = sampleRate == 16000 || sampleRate == 22050 || sampleRate == 24000 ||
+                           sampleRate == 32000 || sampleRate == 44100 || sampleRate == 48000;
+    if (!supported) {
+      log_e("external-mclk ES8311: unsupported PCM rate %u", (unsigned)sampleRate);
+      return false;
+    }
   }
   i2s_chan_handle_t tx = (i2s_chan_handle_t)txChan_;
 
@@ -279,7 +411,34 @@ bool AudioManager::ensureI2s(uint32_t sampleRate) {
   // Without auto_clear the DMA replays its last buffers on underrun — heard
   // as a looping stutter after playback stops.
   chanCfg.auto_clear = true;
-  if (i2s_new_channel(&chanCfg, &tx, nullptr) != ESP_OK) return false;
+  // DMA depth is the whole reason audio used to cut out, so size it deliberately.
+  //
+  // The pool must outlast one decode block, because decoding runs inline on this
+  // task and nothing is written to I2S while it runs. A 4 KiB MP3 chunk costs
+  // ~85 ms to decode here.
+  //
+  // The required depth scales with the sample rate: 8 x 512 = 4096 frames is
+  // 256 ms at 16 kHz but only 93 ms at 44.1 kHz, which is too thin once the
+  // resampler is removed and playback stays at the file's native rate. 16 x 512
+  // = 8192 frames gives 186 ms at 44.1 kHz — about 2.2x a decode block.
+  //
+  // The pool comes out of one contiguous internal-SRAM block, so this cannot be
+  // raised freely: 12 x 512 at 16 KiB already failed to allocate once (MaxAlloc
+  // was ~54 KB), which surfaced as a dead play button. 16 x 512 = 32 KiB. If
+  // i2s_new_channel() starts failing, lower dma_frame_num rather than desc_num.
+  chanCfg.dma_desc_num = 16;
+  chanCfg.dma_frame_num = 512;
+  esp_err_t chanErr = i2s_new_channel(&chanCfg, &tx, nullptr);
+  if (chanErr != ESP_OK) {
+    // Diagnose rather than fail silently: a too-large DMA pool is the difference
+    // between a working player and a dead play button, and the numbers tell us
+    // immediately whether it was the request or the free space.
+    log_e("i2s_new_channel failed: %s (desc=%u frames=%u, free=%u, maxAlloc=%u)",
+          esp_err_to_name(chanErr), (unsigned)chanCfg.dma_desc_num, (unsigned)chanCfg.dma_frame_num,
+          (unsigned)esp_get_free_heap_size(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    tx = nullptr;
+    return false;
+  }
 
   i2s_std_config_t std = {};
   std.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(sampleRate);
@@ -300,10 +459,32 @@ bool AudioManager::ensureI2s(uint32_t sampleRate) {
     i2s_del_channel(tx);
     return false;
   }
+
+  // Report the frequencies the driver actually programmed. Guessing at dividers
+  // from the header macros has already been wrong twice, so log the measured
+  // clock tree: MCLK / BCLK tell us immediately whether the requested sample
+  // rate was honoured. For 16-bit stereo at Fs the expected values are
+  //   MCLK = 256 x Fs, BCLK = 32 x Fs   (2 channels x 16 bits)
+  {
+    i2s_chan_info_t info = {};
+    if (i2s_channel_get_info(tx, &info) == ESP_OK) {
+      log_i("i2s clk: req=%u mclk=%u (expect %u) bclk=%u (expect %u) clk_src=%d",
+            (unsigned)sampleRate, (unsigned)info.mclk_hz, (unsigned)(sampleRate * 256),
+            (unsigned)info.bclk_hz, (unsigned)(sampleRate * 32), (int)info.clk_src);
+    }
+  }
   txChan_ = tx;
   chanEnabled_ = true;
   currentRate_ = sampleRate;
   return true;
+}
+
+void AudioManager::releaseI2s() {
+  // Hand the I2S peripheral back without touching the codec or the amplifier.
+  // A second audio backend (ESP32-audioI2S) needs I2S_NUM_0 for itself, and the
+  // ESP32 only has two I2S peripherals — holding this one is what makes that
+  // backend fail with "no available channel found".
+  teardownI2s();
 }
 
 void AudioManager::teardownI2s() {
@@ -374,8 +555,32 @@ bool AudioManager::startPlayback(const WavSource& source, const WavInfo& info, b
   playbackState_.store(PlaybackState::Playing, std::memory_order_release);
 
   // Same shape as the OEM "musicTask" (high priority, core 0 — the Arduino
-  // loop owns core 1); 8K stack covers the on-stack sample buffers.
-  if (xTaskCreatePinnedToCore(taskEntry, "audio_play", 8192, this, 10, &task_, 0) != pdPASS) {
+  // loop owns core 1).
+  //
+  // 24 KiB stack, sized from measurement and from what internal SRAM can
+  // actually hand out.
+  //
+  // Measured with uxTaskGetStackHighWaterMark: the peak is ~2.7 KiB. The
+  // "Stack canary watchpoint triggered (audio_play)" reports were never the
+  // stack running out — a decoder buffer overrun put a stray write into the
+  // guard region, which FreeRTOS reports as a stack fault. Chasing that by
+  // raising the stack only made things worse: 64 KiB does not even fit here.
+  //
+  // Internal SRAM free is ~70 KiB but the LARGEST CONTIGUOUS block is only
+  // ~31 KiB, because the decoder's own buffers (pcm ring / OLA staging /
+  // mp3 chunk = ~44 KiB) are interleaved with everything else. A 64 KiB
+  // request fails outright and the play button goes dead:
+  //   audio task create failed (stack=65536, freeInt=71884, maxAlloc=31732)
+  //
+  // 24 KiB both fits inside the largest free block and leaves ~9x headroom
+  // over the measured peak. Do NOT raise this again without first checking
+  // heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL).
+  constexpr uint32_t kAudioTaskStackBytes = 24 * 1024;
+  if (xTaskCreatePinnedToCore(taskEntry, "audio_play", kAudioTaskStackBytes, this, 10, &task_, 0) !=
+      pdPASS) {
+    log_e("audio task create failed (stack=%u, freeInt=%u, maxAlloc=%u)", (unsigned)kAudioTaskStackBytes,
+          (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+          (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     task_ = nullptr;
     playbackState_.store(PlaybackState::Idle, std::memory_order_release);
     return false;
@@ -437,9 +642,13 @@ void AudioManager::taskEntry(void* self) { static_cast<AudioManager*>(self)->tas
 
 void AudioManager::taskLoop() {
   i2s_chan_handle_t tx = (i2s_chan_handle_t)txChan_;
-  alignas(int16_t) uint8_t inBuf[READ_CHUNK];
+  // Static (not stack) buffers: the libhelix decode call chain runs *inside*
+  // read() on this task's stack, and 12 KiB of on-stack buffers here was
+  // overflowing the 20 KiB task stack (stack canary watchpoint on large/high-
+  // bitrate files). Moving them off-stack leaves the whole stack for decode.
+  alignas(int16_t) static uint8_t inBuf[READ_CHUNK];
   // Mono is duplicated into both slots, so the out buffer is 2x.
-  int16_t outBuf[READ_CHUNK];
+  static int16_t outBuf[READ_CHUNK];
 
   // Prime the line with silence, then raise the amp: the AW8737A pops loudly
   // when enabled against an idle or just-started I2S line.
@@ -517,7 +726,9 @@ void AudioManager::taskLoop() {
       continue;
     }
 
+    const uint32_t t0 = micros();
     const int n = source_.read(inBuf, want);
+    const uint32_t readUs = micros() - t0;
     if (n <= 0) {
       if (loop_ && source_.seek(wav_.dataStart)) {
         consumed = 0;
@@ -548,7 +759,18 @@ void AudioManager::taskLoop() {
     }
 
     size_t written = 0;
-    if (i2s_channel_write(tx, outBuf, outBytes, &written, pdMS_TO_TICKS(1000)) != ESP_OK) {
+    const uint32_t w0 = micros();
+    const esp_err_t wr = i2s_channel_write(tx, outBuf, outBytes, &written, pdMS_TO_TICKS(1000));
+    const uint32_t writeUs = micros() - w0;
+    if (++diagPass_ == 1 || readUs > 5000 || writeUs > 5000) {
+      // Report the stack high-water mark too: it is the smallest amount of free
+      // stack ever seen on this task, so it tells us how close the decode chain
+      // runs to the edge. Without this we are guessing at stack sizes blind.
+      Serial.printf("[AUDIO] pass n=%d read=%luus write=%luus\n", n, (unsigned long)readUs,
+                    (unsigned long)writeUs);
+      diagPass_ = 0;
+    }
+    if (wr != ESP_OK) {
       playbackState_.store(PlaybackState::Stopping, std::memory_order_release);
       break;
     }
@@ -557,6 +779,18 @@ void AudioManager::taskLoop() {
   setAmp(false);
   i2s_channel_disable(tx);
   chanEnabled_ = false;
+
+  // Report how much of the stack the decode chain actually touched. The high
+  // water mark is the smallest number of free bytes ever seen; if it comes back
+  // small (say under 4 KiB) the task is running on fumes and any deeper call —
+  // the OLA path at a non-1.0 rate, or a switch mid-decode — will overflow it.
+  // Logged on the way out rather than periodically so it never lands in the
+  // middle of a decode.
+  {
+    const UBaseType_t hwWords = uxTaskGetStackHighWaterMark(nullptr);
+    log_i("audio task stack high-water: %u bytes free (of %u)", (unsigned)(hwWords * sizeof(StackType_t)),
+          (unsigned)kAudioTaskStackBytes);
+  }
 
   task_ = nullptr;
   playbackState_.store(PlaybackState::Idle, std::memory_order_release);
@@ -581,6 +815,7 @@ bool AudioManager::parseWavHeader(const WavSource&, WavInfo&) { return false; }
 bool AudioManager::startPlayback(const WavSource&, const WavInfo&, bool) { return false; }
 bool AudioManager::ensureI2s(uint32_t) { return false; }
 void AudioManager::teardownI2s() {}
+void AudioManager::releaseI2s() {}
 bool AudioManager::codecInit() { return false; }
 bool AudioManager::codecWrite(uint8_t, uint8_t) { return false; }
 void AudioManager::codecMute(bool) {}
